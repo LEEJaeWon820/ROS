@@ -1,0 +1,347 @@
+#include "ros/ros.h" 
+#include "geometry_msgs/Twist.h"
+#include "std_msgs/Bool.h"
+#include "std_msgs/Int8.h"
+#include "std_msgs/Int16.h"
+#include "std_msgs/Int32.h"
+#include "std_msgs/Float32.h"
+#include "sensor_msgs/Imu.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.h"
+
+#include <math.h>
+#include <iostream>
+
+#define _USE_MATH_DEFINES
+
+#define RAD2DEG(x) ((x)*180./M_PI)
+#define DEG2RAD(x) ((x)/180.*M_PI)
+
+#define MAX_angluar_velocity M_PI/10
+
+#define IMU_CONTROL           0
+#define LANE_CONTROL          1
+#define MAZE_CONTROL          2
+#define STEER_CONTROL         3
+
+using namespace std;
+
+double roll,pitch,yaw;
+double roll_d,pitch_d,yaw_d, yaw_d_360;
+double yaw_d_old  = 0.;
+double target_yaw = 0.;
+
+double Kp_imu_degree             = 0.01;
+double Kd_imu_degree             = 0.04;
+double Ki_imu_degree             = 0.00;
+
+double Kp_vision                 = 0.01;
+double Kd_vision                 = 0.04;
+double Ki_vision                 = 0.00;
+
+double Kp_maze                   = 0.01;
+double Kd_maze                   = 0.04;
+double Ki_maze                   = 0.00;
+
+double error_imu_degree			 = 0.0;
+double error_imu_degree_old      = 0.0;
+
+double error_vision              = 0.0;
+double error_vision_old          = 0.0;
+double error_vision_sum          = 0.0;
+
+double error_maze                = 0.0;
+double error_maze_old            = 0.0;
+double error_maze_sum            = 0.0;
+
+double imu_heading_anlge_degree  = 0.0;
+
+bool   control_action_flag  = 0;
+bool   use_imu = false;
+
+int    vision_xte_right_angle_max    = -42;
+int    vision_xte_left_angle_max     =  42;
+
+int    maze_right_angle_max    = -42;
+int    maze_left_angle_max     =  42;
+
+int    steering_control_mode        = -1;
+int    car_speed                    = 0;
+int    steer_input                  = 0;
+double target_yaw_degree            = 0.0;
+
+double vision_cross_track_error     = 0.0;
+double maze_xte                     = 0.0;
+
+bool   yaw_control_complete_flag    = false;
+
+void yaw_control_speed_input_Callback(const std_msgs::Int16& msg)
+{
+	car_speed = msg.data;
+}
+
+void target_yaw_degree_Callback(const std_msgs::Float32& msg)
+{
+	target_yaw_degree = msg.data;
+}
+     
+void vision_cross_track_error_Callback(const std_msgs::Float32& msg)
+{
+	vision_cross_track_error = msg.data;	
+	control_action_flag = 1; 
+	//printf("vision XTE received!\n");
+}
+
+void imu_yaw_degree_Callback(const std_msgs::Float32& msg)
+{
+	imu_heading_anlge_degree = msg.data;   
+	
+	if(imu_heading_anlge_degree < 0)
+    {
+        imu_heading_anlge_degree += 360.0;
+    }
+    
+	//ROS_INFO("imu_heading_anlge_degree : %6.3lf ",imu_heading_anlge_degree );
+
+   	control_action_flag   = 1;	
+}
+
+void steer_input_Callback(const std_msgs::Int16& msg)
+{
+	steer_input = msg.data;
+	control_action_flag   = 1;	
+}
+
+void yaw_control_mode_Callback(const std_msgs::Int8& msg)
+{
+	steering_control_mode = msg.data;
+	control_action_flag   = 1;	
+}
+
+void maze_xte_Callback(const std_msgs::Float32& msg)
+{
+	maze_xte = msg.data;
+	control_action_flag = 1;
+}
+
+double imu_control_angle_degree(void)
+{
+	double steering_angle_control = 0;
+
+    error_imu_degree = target_yaw_degree - imu_heading_anlge_degree;
+
+    if (error_imu_degree > 180)
+    {
+        error_imu_degree = error_imu_degree - 360;
+    }
+    else if (error_imu_degree < -180)
+    {
+        error_imu_degree = error_imu_degree + 360;
+    }
+
+    double error_imu_degree_d = error_imu_degree - error_imu_degree_old;
+
+    steering_angle_control = Kp_imu_degree * error_imu_degree + Kd_imu_degree * error_imu_degree_d;
+
+    error_imu_degree_old = error_imu_degree;
+
+    return steering_angle_control;
+}
+
+double maze_control_yaw(void)
+{
+	double steering_angle_control = 0;
+	
+	double error_d = 0;
+	double error1;
+    
+	error_maze = maze_xte;	
+ 
+	error_d = error_maze - error_maze_old;
+    
+	steering_angle_control = Kp_maze * error_maze + Kd_maze * error_d;
+	
+	error_maze_old = error_maze; 
+	
+	if( steering_angle_control <= maze_right_angle_max )  steering_angle_control = maze_right_angle_max;
+	if( steering_angle_control >= maze_left_angle_max )   steering_angle_control =  maze_left_angle_max;
+	
+	printf("steering_control_mode : %d\n",steering_control_mode);	
+	ROS_INFO("maze_xte : %6.3lf steer angle : %lf",maze_xte, steering_angle_control );
+	
+	return steering_angle_control;
+}
+
+double control_vision_xte(void)
+{
+	double steering_angle_control = 0;
+	double  error_vision_d        = 0.0; 
+    //printf("sin(%6.3lf - %6.3lf) = %6.3lf\n ", target_yaw, yaw_d, CW_flag );
+    //printf("error %6.3lf  %6.3lf \n", error1, error2);
+
+	error_vision = vision_cross_track_error;	
+	
+	error_vision_d = error_vision - error_vision_old  ;
+	
+	steering_angle_control = Kp_vision * error_vision + Kd_vision * error_vision_d + Ki_vision * error_vision_sum;
+	
+	error_vision_old = error_vision ;
+	error_vision_sum = 0.0;
+	
+	printf("error : %6.3lf  erorr_d %6.3lf steering_angle :%6.3lf\n",error_vision,error_vision_d ,steering_angle_control);
+	
+	if( steering_angle_control <= vision_xte_right_angle_max )  steering_angle_control = vision_xte_right_angle_max;
+	if( steering_angle_control >= vision_xte_left_angle_max )   steering_angle_control = vision_xte_left_angle_max;
+	
+	return steering_angle_control;
+}
+
+int main(int argc, char **argv)
+{
+	
+	double pid_output = 0.0;
+	ros::init(argc, argv, "aa10_car_yaw_control_node");
+	ros::NodeHandle n;
+
+	std::string imu_yaw_angle_topic                = "/handsfree/imu_yaw_radian";
+	std::string imu_angle_degree_topic             = "/handsfree/imu_yaw_degree";
+	std::string yaw_control_mode_topic             = "/Car_Control_Cmd/steering_control_mode";
+
+	std::string yaw_target_topic                   = "/Car_Control_Cmd/Target_Angle";
+	std::string yaw_control_steering_output_topic  = "/Car_Control_Cmd/SteerAngle_Int16";
+	std::string yaw_control_speed_input_topic      = "/Car_Control_Cmd/Speed_Int16";
+	
+	std::string vision_cross_track_error_topic     = "/xte/vision"; 
+	std::string maze_xte_topic                     = "/xte/maze"; 
+	std::string steer_input_topic                  = "/xte/steer";
+	
+
+	ros::param::get("~use_imu", use_imu);     
+
+	ros::param::get("~imu_yaw_angle_topic", imu_yaw_angle_topic);     
+	ros::param::get("~imu_angle_degree_topic", imu_angle_degree_topic);     
+	
+	ros::param::get("~yaw_control_mode_topic" ,yaw_control_mode_topic);
+	ros::param::get("~yaw_target_topic",  yaw_target_topic);   
+	ros::param::get("~steer_input_topic",steer_input_topic);
+	                                   
+	ros::param::get("~yaw_control_steering_output_topic",  yaw_control_steering_output_topic);
+
+	ros::param::get("~vision_cross_track_error_topic",vision_cross_track_error_topic);
+	
+	ros::param::get("~Kp_imu_degree", Kp_imu_degree);  
+	ros::param::get("~Kd_imu_degree", Kd_imu_degree);  
+	ros::param::get("~Ki_imu_degree", Ki_imu_degree);  
+	
+	ros::param::get("~Kp_vision", Kp_vision);  
+	ros::param::get("~Kd_vision", Kd_vision);  
+	ros::param::get("~Ki_vision", Ki_vision);
+	
+	ros::param::get("~Kp_maze", Kp_maze);  
+	ros::param::get("~Kd_maze", Kd_maze);  
+	ros::param::get("~Ki_maze", Ki_maze);
+	
+	ros::param::get("~vision_xte_left_angle_max",  vision_xte_left_angle_max);
+	ros::param::get("~vision_xte_right_angle_max", vision_xte_right_angle_max);
+	
+	ros::param::get("~maze_left_angle_max", maze_left_angle_max);
+	ros::param::get("~maze_right_angle_max", maze_right_angle_max);
+
+	roll = pitch = yaw = roll_d = pitch_d = yaw_d = yaw_d_old = 0.0;
+
+	geometry_msgs::Vector3 rpy_angle_radian;
+	geometry_msgs::Vector3 rpy_angle_degree;
+
+	std_msgs::Int16 steering_angle;
+
+	ros::Subscriber sub_imu_yaw_degree                 = n.subscribe(imu_angle_degree_topic, 1, imu_yaw_degree_Callback);
+	ros::Subscriber sub_target_yaw_degree              = n.subscribe(yaw_target_topic, 1, target_yaw_degree_Callback); 
+	ros::Subscriber sub_yaw_control_mode               = n.subscribe(yaw_control_mode_topic, 1, yaw_control_mode_Callback);
+	ros::Subscriber sub_vision_cross_track_error       = n.subscribe(vision_cross_track_error_topic,1, vision_cross_track_error_Callback);
+	ros::Subscriber sub_maze_xte                       = n.subscribe(maze_xte_topic,1, maze_xte_Callback);
+	ros::Subscriber sub_car_speed_input                = n.subscribe(yaw_control_speed_input_topic, 2, yaw_control_speed_input_Callback);
+	ros::Subscriber sub_steer_input                    = n.subscribe(steer_input_topic ,2 , steer_input_Callback);
+	
+	ros::Publisher  yaw_control_steering_output_pub    = n.advertise<std_msgs::Int16>(yaw_control_steering_output_topic, 1);
+
+	ros::Rate loop_rate(25.0); //10.0HZ
+  
+	while(ros::ok())
+	{
+		  rpy_angle_radian.x = roll;
+		  rpy_angle_radian.y = pitch;
+		  rpy_angle_radian.z = yaw;
+		  
+		  rpy_angle_degree.x = roll_d;
+		  rpy_angle_degree.y = pitch_d;
+		  rpy_angle_degree.z = yaw_d;
+		  
+		  if(control_action_flag == 1)
+		  {
+				if (steering_control_mode == IMU_CONTROL)   // imu yaw control mode  2023.10.07
+				{    
+					ROS_INFO("IMU_CONTROL_mode");	
+
+					pid_output = imu_control_angle_degree();
+
+					if (fabs(target_yaw_degree-imu_heading_anlge_degree) <= 3)
+					{
+						ROS_INFO("Target angle reached!");
+						steering_angle.data = 0;  // 움직임을 멈춤
+						printf("steering_angle.data : %d\n",steering_angle.data);
+
+					}
+					else
+					{
+						steering_angle.data = (int)pid_output;
+						printf("target_yaw_degree : %6.3lf\n",target_yaw_degree);
+						printf("imu_heading_anlge_degree : %6.3lf\n",imu_heading_anlge_degree);
+						//printf("error_imu_degree : %6.3lf\n",error_imu_degree);
+						printf("pid_output : %6.3lf\n",pid_output);
+						printf("steering_angle.data : %d\n",steering_angle.data);
+					}
+					
+					yaw_control_steering_output_pub.publish(steering_angle);    
+				}
+
+				else if (steering_control_mode == LANE_CONTROL)   // vision control mode  2023.10.07
+				{
+					ROS_INFO("Vision_Control_mode");			
+					steering_angle.data = control_vision_xte();
+					yaw_control_steering_output_pub.publish(steering_angle); 
+					printf("steering_angle.data : %d\n",steering_angle.data);   
+				}
+
+				else if (steering_control_mode == MAZE_CONTROL)  //traffic cone control
+				{
+					ROS_INFO("Maze_Control_mode");			
+					pid_output = maze_control_yaw();
+					steering_angle.data = pid_output;
+					yaw_control_steering_output_pub.publish(steering_angle); 
+					printf("steering_angle.data : %d\n",steering_angle.data);   
+				}
+
+				else if (steering_control_mode == STEER_CONTROL)
+				{
+					ROS_INFO("Steer_Control_mode");	
+					steering_angle.data = steer_input;
+					yaw_control_steering_output_pub.publish(steering_angle);
+					printf("steering_angle.data : %d\n",steering_angle.data);
+				}
+
+				else
+				{
+					
+				}
+			
+		  }
+		  
+		  else
+		  {
+			ROS_WARN("No target_angle");  
+		  }
+		ros::spinOnce();
+		loop_rate.sleep();
+	  }
+
+		return 0;
+}
