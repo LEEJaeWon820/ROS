@@ -1,0 +1,64 @@
+#include <Servo.h>
+
+// Servo object
+Servo steeringServo;
+
+// Constants
+const int SERVO_PIN = 8;  // 서보모터 연결 핀
+const int SERVO_CENTER = 90;  // 서보 중앙값
+const int MAX_ANGLE = 42;  // 최대 스티어링 각도
+
+// Variables
+String inputString = "";  // 시리얼 입력 저장
+boolean stringComplete = false;  // 문자열 수신 완료 플래그
+int currentAngle = SERVO_CENTER;  // 현재 서보 각도
+
+void setup() {
+  // 서보모터 초기화
+  steeringServo.attach(SERVO_PIN);
+  steeringServo.write(SERVO_CENTER);
+
+  // 하드웨어 시리얼 초기화 (Jetson과 통신)
+  Serial1.begin(9600);  // RX(0), TX(1) 핀 사용
+  // USB 시리얼 (디버깅용)
+  Serial.begin(9600);
+
+  Serial.println("Arduino ready for steering commands");
+  inputString.reserve(200);
+}
+
+void loop() {
+
+  // 하드웨어 시리얼로부터 데이터 읽기
+  while (Serial1.available()) {
+    char inChar = (char)Serial1.read();
+
+    if (inChar == '\n') {
+      // 수신된 문자열을 정수로 변환
+      int targetAngle = inputString.toInt();
+
+      // 디버깅용 출력
+      Serial.print("Received angle: ");
+      Serial.println(targetAngle);
+
+      // 각도 제한 (-42 ~ 42)
+      targetAngle = constrain(targetAngle, -MAX_ANGLE, MAX_ANGLE);
+
+      // 서보 각도로 변환 (90도가 중앙)
+      int servoAngle = SERVO_CENTER + targetAngle;
+
+      // 최종 각도 제한 (0 ~ 180)
+      servoAngle = constrain(servoAngle, 0, 180);
+
+      // 서보모터 제어
+      steeringServo.write(servoAngle);
+      currentAngle = servoAngle;
+
+      // 문자열 초기화
+      inputString = "";
+    } else {
+      // 수신된 문자를 문자열에 추가
+      inputString += inChar;
+    }
+  }
+}
